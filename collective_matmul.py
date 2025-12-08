@@ -24,6 +24,7 @@ ENABLE_DEBUG = False
 N_BATCH = 256
 K1 = 1024
 K2 = 4096 
+K3 = K1 // N_DEVICES
 
 
 ################################################################################
@@ -182,13 +183,31 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
     """
 
     # TODO: your code here
-    pass
+
+    out_ref[...] = jnp.astype (
+                        pl.dot (
+                            x_ref[...], 
+                            w_ref[...], 
+                            trans_a=False, trans_b=False
+                            ), 
+                        jnp.bfloat16
+                    )
 
 
 def all_gather_matmul_pallas_scratch_specs(x):
-    return {
-        # TODO: your code here
+
+    scratch_refs = {
+        "AG_X": pltpu.VMEM(
+            shape=(N_DEVICES, N_BATCH, K3),
+            dtype=jnp.bfloat16,
+        ),
     }
+
+    for i in range (4):
+        scratch_refs [f"AG_S{i}"] = pltpu.SemaphoreType.DMA
+        scratch_refs [f"AG_R{i}"] = pltpu.SemaphoreType.DMA
+
+    return scratch_refs
 
 
 def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
@@ -202,15 +221,100 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
 
     All arrays are in VMEM and have dtype bfloat16.
     """
+    def Send (dst_dev, src_data, dst_data, scratch_refs, id):
+        pallas_rdma_start(
+            src_ref=src_data,
+            dst_ref=dst_data,
+            dst_device_id=dst_dev,
+            src_send_sem=scratch_refs[f"AG_S{id}"],
+            dst_recv_sem=scratch_refs[f"AG_R{id}"],
+        )
 
-    # TODO: your code here
-    pass
+    def Wait (dst_dev, src_data, dst_data, scratch_refs, id):
+        pallas_rdma_wait_send(src_ref=src_data, src_send_sem=scratch_refs[f"AG_S{id}"])
+        pallas_rdma_wait_recv(dst_ref=dst_data,dst_recv_sem=scratch_refs [f"AG_R{id}"])
+
+    def MatMul (dev, X, w1_ref, out_ref):
+
+        A_ref = X.at[pl.ds(dev, 1)]
+        A_arr = A_ref[...]
+        A_arr = A_arr[0, :, :]
+
+        B_ref = w1_ref[pl.ds(dev * K3, K3), :]
+        B_arr = B_ref[...]
+
+        partial = pl.dot(
+            A_arr,
+            B_arr,
+            trans_a=False,
+            trans_b=False,
+        )
+
+        out_ref[...] += jnp.astype(partial, jnp.bfloat16)
+   
+    
+    src_dev = pallas_get_my_device_id()
+    left = ( src_dev + 1 ) % N_DEVICES
+    opp  = ( src_dev + 2 ) % N_DEVICES
+    right= ( src_dev + 3 ) % N_DEVICES
+    X = scratch_refs["AG_X"]
+
+    x_local = x_ref[...]
+    src_data = X.at[pl.ds(src_dev, 1)]
+    src_data[...] = x_local[None, :, :]
+
+    dst_data = X.at[pl.ds(src_dev, 1)] 
+
+    Send (left, src_data, dst_data, scratch_refs, 0)
+    Send (right,src_data, dst_data, scratch_refs, 1)
+    
+    out_ref[...] = jnp.zeros_like(out_ref[...])
+    MatMul (src_dev,X, w1_ref, out_ref)
+
+    Wait (left , src_data, dst_data, scratch_refs, 0)
+    Wait (right, src_data, dst_data, scratch_refs, 1)
+
+    # T1) first  half of i-1 to the right
+    # T2) second half of i+1 to the left 
+    half_batch = N_BATCH//2
+    src_data_T1 = X.at[pl.ds(left , 1), pl.ds( 0 , half_batch)] 
+    src_data_T2 = X.at[pl.ds(right, 1), pl.ds(half_batch  , half_batch)] 
+    dst_data_T1 = X.at[pl.ds(left , 1), pl.ds(0 , half_batch)] 
+    dst_data_T2 = X.at[pl.ds(right, 1), pl.ds(half_batch  , half_batch)] 
+
+    Send (right , src_data_T1, dst_data_T1, scratch_refs, 2)
+    Send (left  , src_data_T2, dst_data_T2, scratch_refs, 3)
+    
+    MatMul (left,X, w1_ref, out_ref)
+    MatMul (right,X, w1_ref, out_ref)
+
+    Wait (right , src_data_T1, dst_data_T1, scratch_refs, 2)
+    Wait (left  , src_data_T2, dst_data_T2, scratch_refs, 3)
+    
+    MatMul (opp,X, w1_ref, out_ref)
+
+
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
-    return {
-        # TODO: your code here
+    
+    scratch_refs = {
+        "Partials": pltpu.VMEM(
+            shape=(N_DEVICES, N_BATCH, K3), 
+            dtype=jnp.bfloat16,
+        ),
+        "Temp": pltpu.VMEM(
+            shape=(3, N_BATCH, K3),
+            dtype=jnp.bfloat16,
+        ),
+
     }
+
+    for i in range (4):
+        scratch_refs [f"RS_S{i}"] = pltpu.SemaphoreType.DMA
+        scratch_refs [f"RS_R{i}"] = pltpu.SemaphoreType.DMA
+    
+    return scratch_refs
 
 
 def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
@@ -223,13 +327,99 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     * out_ref: [N_BATCH, K1 / N_DEVICES]
     """
 
-    # TODO: your code here
-    pass
+    def Send(dst_dev, src_data, dst_data, scratch_refs, id):
+        pallas_rdma_start(
+            src_ref=src_data,
+            dst_ref=dst_data,
+            dst_device_id=dst_dev,
+            src_send_sem=scratch_refs[f"RS_S{id}"],
+            dst_recv_sem=scratch_refs[f"RS_R{id}"],
+        )
+
+    def Wait(dst_dev, src_data, dst_data, scratch_refs, id):
+        pallas_rdma_wait_send(src_ref=src_data, src_send_sem=scratch_refs[f"RS_S{id}"])
+        pallas_rdma_wait_recv(dst_ref=dst_data, dst_recv_sem=scratch_refs[f"RS_R{id}"])
+
+    def MatMul(target_dev_idx, x_ref, w2_ref, out_buf):
+        col_start = target_dev_idx * K3
+        
+        B_ref = w2_ref[:, pl.ds(col_start, K3)]
+        
+        partial = pl.dot(x_ref[...], B_ref[...], trans_a=False, trans_b=False)
+        out_buf[...] = jnp.astype(partial, jnp.bfloat16)
+
+    src_dev = pallas_get_my_device_id()
+    left  = (src_dev + 1) % N_DEVICES
+    opp   = (src_dev + 2) % N_DEVICES
+    right = (src_dev + 3) % N_DEVICES
+    
+    Partials = scratch_refs["Partials"]
+    Temp     = scratch_refs["Temp"]
+
+    temp_L   = Temp.at[0]
+    temp_R   = Temp.at[1]
+    temp_Opp = Temp.at[2]
+
+    N_BATCH = x_ref.shape[0]
+    half_batch = N_BATCH // 2
+
+    MatMul(opp, x_ref, w2_ref, temp_Opp)
+
+    src_Opp_Top_shard = temp_Opp.at[pl.ds(0, half_batch)]
+    dst_at_left_shard = Partials.at[src_dev, pl.ds(0, half_batch)]
+    Send(left, src_Opp_Top_shard, dst_at_left_shard, scratch_refs, id = 0)
+
+    src_Opp_Bot_shard = temp_Opp.at[pl.ds(half_batch , half_batch)]
+    dst_at_right_shard = Partials.at[src_dev, pl.ds(half_batch , half_batch)]
+    Send(right, src_Opp_Bot_shard, dst_at_right_shard, scratch_refs, id = 1)
+
+    MatMul(left,  x_ref, w2_ref, temp_L)
+    MatMul(right, x_ref, w2_ref, temp_R)
+
+    Wait(left,  src_Opp_Top_shard, dst_at_left_shard,  scratch_refs, id= 0)
+    Wait(right, src_Opp_Bot_shard, dst_at_right_shard, scratch_refs, id= 1)
+
+    recv_from_right_top_shard = Partials.at[right, pl.ds(0, half_batch)]
+    recv_from_left_bot_shard  = Partials.at[left, pl.ds(half_batch , half_batch)]
+
+    temp_L.at[pl.ds(0, half_batch)][...] += recv_from_right_top_shard[...]
+    temp_R.at[pl.ds(half_batch , half_batch)][...] += recv_from_left_bot_shard[...]
+
+    dst_full_at_left  = Partials.at[src_dev]
+    dst_full_at_right = Partials.at[src_dev]
+
+    Send(left,  temp_L, dst_full_at_left,  scratch_refs, id= 2)
+    Send(right, temp_R, dst_full_at_right, scratch_refs, id= 3)
+    MatMul(src_dev, x_ref, w2_ref, out_ref) 
+
+    Wait(left,  temp_L, dst_full_at_left,  scratch_refs, id= 2)
+    Wait(right, temp_R, dst_full_at_right, scratch_refs, id= 3)
+
+    out_ref[...] += Partials.at[left][...]
+    out_ref[...] += Partials.at[right][...]
 
 
 def neural_network_pallas_scratch_specs(x, w1_refs, w2_refs):
     return {
         # TODO: your code here
+        "NB_K1": pltpu.VMEM(
+            shape=(N_BATCH, K1),
+            dtype=jnp.bfloat16,
+        ),
+
+        "NB_K2": pltpu.VMEM(
+            shape=(N_BATCH, K2),
+            dtype=jnp.bfloat16,
+        ),
+
+        "NB_K3": pltpu.VMEM(
+            shape=(N_BATCH, K3),
+            dtype=jnp.bfloat16,
+        ),
+        
+        # sending x is wrong but the functions don't use it anyway
+        **matmul_reduce_scatter_pallas_scratch_specs(x),
+        **all_gather_matmul_pallas_scratch_specs (x)
     }
 
 
@@ -252,8 +442,62 @@ def neural_network_pallas_kernel(init_x_ref, w1_refs, w2_refs, out_ref, scratch_
     * out_ref: Pallas array reference with shape [N_BATCH, K1]. Should be written to.
     """
 
-    # TODO: your code here
-    pass
+    def MM (A, B):
+        partial = pl.dot(A[...], B[...], trans_a=False, trans_b=False)
+        return jnp.astype(partial, jnp.bfloat16)
+
+
+    NB_K1 = scratch_refs ["NB_K1"]
+    NB_K2 = scratch_refs ["NB_K2"]
+    NB_K3 = scratch_refs ["NB_K3"]
+
+
+
+    NB_K1 [...] = init_x_ref [...]
+    NB_K2 [...] = MM (NB_K1, w1_refs [0])
+
+    ############
+    NB_K2 [...] = jax.nn.gelu (NB_K2 [...])
+    # NB_K3 = 
+    matmul_reduce_scatter_pallas_kernel (NB_K2, w2_refs .at[0], NB_K3, scratch_refs)
+    # NB_K2 =
+    all_gather_matmul_pallas_kernel (NB_K3, w1_refs .at[1], NB_K2, scratch_refs)
+
+    ############
+    NB_K2 [...] = jax.nn.gelu (NB_K2 [...])
+    # NB_K3 = 
+    matmul_reduce_scatter_pallas_kernel (NB_K2, w2_refs .at[1], NB_K3, scratch_refs)
+    # NB_K2 =
+    all_gather_matmul_pallas_kernel (NB_K3, w1_refs .at[2], NB_K2, scratch_refs)
+
+    ############
+    NB_K2 [...] = jax.nn.gelu (NB_K2 [...])
+    # NB_K3 = 
+    matmul_reduce_scatter_pallas_kernel (NB_K2, w2_refs .at[2], NB_K3, scratch_refs)
+
+
+    ############
+    # x = all_gather(x), NB_K3 -> NB_K1 = out_ref
+    src_dev = pallas_get_my_device_id()
+
+    out_ref [pl.ds (0,N_BATCH), pl.ds (src_dev * K3 ,K3)] = NB_K3 [...]
+
+    dst_ref = out_ref .at[pl.ds (0,N_BATCH), pl.ds (src_dev * K3 ,K3)]
+
+    for i in range (1,N_DEVICES):
+        dst_dev = (src_dev + i) % N_DEVICES
+        pallas_rdma_start(
+            src_ref=NB_K3,
+            dst_ref=dst_ref,
+            dst_device_id=dst_dev,
+            src_send_sem=scratch_refs[f"AG_S{i}"],
+            dst_recv_sem=scratch_refs[f"AG_R{i}"],
+        )
+
+    for i in range (1,N_DEVICES):
+        pallas_rdma_wait_send(src_ref=NB_K3   , src_send_sem=scratch_refs [f"AG_S{i}"])
+        pallas_rdma_wait_recv(dst_ref=dst_ref , dst_recv_sem=scratch_refs [f"AG_R{i}"])
+
 
 
 ## <--- /your code here --->
